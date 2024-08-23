@@ -1,0 +1,173 @@
+import os
+import subprocess
+from pathlib import Path
+
+# TODO: These modules need to be pip installed into the vmassign_venv at the moment
+import pandas as pd
+from tqdm import tqdm
+
+from vmassign import config, SpannerDatabase
+
+
+def add_gcloud_to_path(where_gcloud):
+    os.environ["PATH"] += os.pathsep + str(Path(where_gcloud).parent)
+
+def gcloud_in_path():
+    try:
+        subprocess.run(["gcloud", "--help", "|", "cat"], check=True, shell=True)
+    except FileNotFoundError:
+        return False
+    return True
+
+def raise_if_gcloud_not_in_path(where_gcloud=None):
+    if where_gcloud is not None:
+        add_gcloud_to_path(where_gcloud)
+
+    if not gcloud_in_path():
+        message = (
+            "gcloud not found in PATH. "
+            "Please install Google Cloud SDK if you have not already. "
+            "Pass the path returned by `where gcloud` to the variable where_gcloud."
+            " Then retry running this script."
+        )
+        raise FileNotFoundError(message)
+
+def copy_remote_files_to_dir(vm_name, remote_files, local_dir):
+    local_dir = Path(local_dir)
+    local_files = []
+    for remote_file in remote_files:
+        remote_file = Path(remote_file)
+        local_file = local_dir / f"{vm_name}.{remote_file.name}"
+        
+        cmd = [
+            "gcloud",
+            "compute",
+            "scp",
+            f"{vm_name}:{remote_file.as_posix()}",
+            f"{local_file.as_posix()}",
+            "--zone",
+            config.VM_ZONE,
+        ]
+        
+        print(f'Running command: {" ".join(cmd)}')
+
+        try:
+            subprocess.run(" ".join(cmd), check=True, shell=True)
+            local_files.append(local_file.as_posix())
+        except subprocess.CalledProcessError as e:
+            print(f"Error running command: {e.stderr}")
+            raise
+
+    return local_files
+
+def get_assigned_vms_from_database():
+    project_id = config.PROJECT_ID
+    instance_id = config.DB_INSTANCE_ID
+    database_id = config.DB_DATABASE_ID
+    table_name = config.DB_TABLE_NAME
+
+    spanner_db = SpannerDatabase.load_database(
+        project_id, instance_id, database_id, table_name
+    )
+
+    assigned_vms = spanner_db.get_assigned_vms()
+    user_by_vm = {}
+    for vm_name in assigned_vms:
+        user = spanner_db.get_user_email(hostname=vm_name)
+        user_by_vm[vm_name] = user
+
+    return user_by_vm
+
+
+def find_label_files(vm_name: str, remote_dir: str):
+    remote_dir = Path(remote_dir)
+
+    # cmd = [
+    #     "gcloud",
+    #     "compute",
+    #     "ssh",
+    #     vm_name,
+    #     "--zone",
+    #     config.VM_ZONE,
+    #     f"--command=find {remote_dir.as_posix()} -name '*.slp' -not -path '*/models/*' -not -path '*/predictions/*'", 
+    # ]
+
+    cmd = [
+        f"gcloud compute ssh {vm_name} "
+        f"--zone {config.VM_ZONE} "
+        f"--command='find {remote_dir.as_posix()} -name \"*.slp\" "
+        f"-not -path \"*/models/*\" -not -path \"*/predictions/*\"'"
+    ]
+
+    print(f'Running command: {cmd}')
+
+    try:
+        result = subprocess.run(cmd, shell=True, check=True, capture_output=True)
+        
+        # Get list of SLP files (last character is newline, so remove it)
+        slp_files = result.stdout[:-1].decode("utf-8").split("\n")
+
+        return slp_files if slp_files != [''] else []
+    
+    except subprocess.CalledProcessError as e:
+
+        print(f"Error running command: {e.stderr}")
+        return None
+
+
+def save_to_csv(data, local_dir):
+    df = pd.DataFrame(data)
+    csv_file = Path(local_dir) / "vm_data.csv"
+    df.to_csv(csv_file, index=False)
+
+
+
+def test_main(remote_dir, local_dir, vm_name):
+
+    # Add gcloud to PATH if where_gcloud is provided
+    # raise_if_gcloud_not_in_path(where_gcloud=where_gcloud)
+
+    # Create dictionary to store data
+    # data = {"filename": [], "vm-hostname": [], "user-email": []}
+    data = {"filename": [], "vm-hostname": []}
+
+    # Get data for each VM
+    try:
+        
+        # Get list of SLP files in remote directory
+        remote_files = find_label_files(vm_name, remote_dir)
+
+        # Print the list of SLP files
+        if remote_files:
+            for file in remote_files:
+                print(file)
+        else:
+            print("No SLP files found.")
+
+        # Copy remote files to local directory
+        local_files = copy_remote_files_to_dir(
+            vm_name=vm_name, remote_files=remote_files, local_dir=local_dir
+        )
+
+        # Store data
+        for local_file in local_files:
+            data["filename"].append(local_file)
+            data["vm-hostname"].append(vm_name)
+
+    except Exception as e:
+        raise e
+    finally:
+        save_to_csv(data, local_dir)
+        
+
+if __name__ == "__main__":
+    vm_name = "justinshen-vm-001-20240814090614"
+    remote_dir = "/home/liezl/sleap-datasets/drosophila-melanogaster-courtship"
+    local_dir = "/Users/justinshen/Downloads/vmdata"
+    where_gcloud = r"path\to\Google\Cloud SDK\google-cloud-sdk\bin\gcloud"
+    test_main(
+        vm_name = vm_name,
+        remote_dir=remote_dir,
+        local_dir=local_dir,
+        # where_gcloud=where_gcloud,  # TODO: Pass in output of `where gcloud` if needed
+    )
